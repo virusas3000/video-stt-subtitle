@@ -1,414 +1,633 @@
 #!/usr/bin/env python3
 """
-Mandarin TTS + STT Web App
-- TTS: Edge TTS (free, neural voices)
-- STT: OpenAI Whisper (local, free)
+Video STT Subtitle Server — video upload, transcription, keyword highlight, subtitle overlay.
+Port: 5055 (override with PORT env var).
 """
+import os, sys, asyncio, json, re, uuid, threading, math, sqlite3, shutil, urllib.request, html
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+from flask import Flask, request, jsonify, Response, render_template_string
 
-import asyncio, os, uuid, threading, re
-from flask import Flask, request, jsonify, send_file, render_template_string
-import edge_tts
-import whisper
-from gtts import gTTS
-import azure.cognitiveservices.speech as speechsdk
+# ── Config ───────────────────────────────────────────────────────────────
+PORT = int(os.environ.get("PORT", "5055"))
+JOB_DIR = Path("/tmp/video_stt_jobs")
+JOB_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR = Path("/tmp/video_stt_audio")
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+# Transcription engines
+USE_WHISPER = True
+USE_SENSEVOICE = False  # optional; heavy download on first use
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "deepseek/deepseek-chat"
+
+# Cantonese AI (optional fallback)
+CANTONESE_AI_KEY = os.environ.get("CANTONESE_AI_KEY", "")
+
+# Azure (optional TTS — not primary here)
 AZURE_KEY = os.environ.get("AZURE_SPEECH_KEY", "")
 AZURE_REGION = os.environ.get("AZURE_SPEECH_REGION", "eastasia")
 
 app = Flask(__name__)
-AUDIO_DIR = "/tmp/tts_app/audio"
-os.makedirs(AUDIO_DIR, exist_ok=True)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB uploads
 
-# Job queue for async TTS
-jobs = {}  # job_id -> {"status": "pending|done|error", "url": ..., "error": ...}
+# ── DB ───────────────────────────────────────────────────────────────────
+DB_PATH = str(JOB_DIR / "jobs.db")
+con = sqlite3.connect(DB_PATH, check_same_thread=False)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        status TEXT DEFAULT 'pending',
+        engine TEXT,
+        lang TEXT,
+        srt_path TEXT,
+        keywords_path TEXT,
+        error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+""")
+con.commit()
 
-# Load Whisper model once at startup (base is fast, use "small" for better accuracy)
-print("Loading Whisper model...")
-whisper_model = whisper.load_model("base")
-print("Whisper ready.")
+# ── Transcription model (lazy load) ────────────────────────────────────
+_whisper_model = None
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        print("[INIT] Loading Whisper base model…")
+        _whisper_model = whisper.load_model("base")
+        print("[INIT] Whisper ready.")
+    return _whisper_model
 
-VOICES = [
-    {"id": "edge:zh-CN-XiaoxiaoNeural",  "label": "Edge · 晓晓 Xiaoxiao (女)"},
-    {"id": "edge:zh-CN-YunxiNeural",     "label": "Edge · 云希 Yunxi (男)"},
-    {"id": "edge:zh-CN-XiaoyiNeural",    "label": "Edge · 晓伊 Xiaoyi (女)"},
-    {"id": "edge:zh-CN-YunjianNeural",   "label": "Edge · 云健 Yunjian (男)"},
-    {"id": "edge:zh-CN-XiaochenNeural",  "label": "Edge · 晓辰 Xiaochen (女)"},
-    {"id": "edge:zh-TW-HsiaoChenNeural", "label": "Edge · 曉臻 台灣 (女)"},
-    {"id": "edge:zh-TW-YunJheNeural",    "label": "Edge · 雲哲 台灣 (男)"},
-    {"id": "gtts:zh-CN", "label": "Google TTS · 普通話 (女)"},
-    {"id": "gtts:zh-TW", "label": "Google TTS · 台灣普通話 (女)"},
-    {"id": "azure:zh-CN-YunxiNeural",     "label": "Azure · 云希 Yunxi (男) ⭐"},
-    {"id": "azure:zh-CN-XiaoxiaoNeural",  "label": "Azure · 晓晓 Xiaoxiao (女) ⭐"},
-    {"id": "azure:zh-CN-YunjianNeural",   "label": "Azure · 云健 Yunjian (男)"},
-    {"id": "azure:zh-CN-YunhaoNeural",    "label": "Azure · 云皓 Yunhao (男)"},
-    {"id": "azure:zh-CN-YunxiaNeural",    "label": "Azure · 云夏 Yunxia (男)"},
-    {"id": "azure:zh-CN-YunhanNeural",    "label": "Azure · 云漢 Yunhan (男)"},
-    {"id": "azure:zh-CN-XiaoyiNeural",    "label": "Azure · 晓伊 Xiaoyi (女)"},
-    {"id": "azure:zh-TW-YunJheNeural",    "label": "Azure · 雲哲 YunJhe (男 台灣)"},
-    {"id": "azure:zh-TW-HsiaoChenNeural", "label": "Azure · 曉臻 HsiaoChen (女 台灣)"},
-]
+# ── Helpers ─────────────────────────────────────────────────────────────
+
+def _ffmpeg():
+    """Return working ffmpeg path."""
+    for p in ["/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg", "ffmpeg"]:
+        if shutil.which(p):
+            return p
+    return "ffmpeg"
+
+
+def extract_audio(video_path: str, audio_path: str) -> None:
+    """Extract audio from video using ffmpeg."""
+    import subprocess
+    cmd = [_ffmpeg(), "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame",
+           "-q:a", "2", audio_path]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _secs_to_srt_time(t: float) -> str:
+    h = int(t // 3600)
+    m = int((t % 3600) // 60)
+    s = t % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
+
+
+def segments_to_srt(segments: list[dict]) -> str:
+    """Convert Whisper-style segments to SRT."""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = seg.get("start", 0)
+        end = seg.get("end", start + 2)
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        lines.append(f"{i}\n{_secs_to_srt_time(start)} --> {_secs_to_srt_time(end)}\n{text}\n")
+    return "\n".join(lines)
+
+
+# ── Keyword extraction (two-stage OpenRouter) ────────────────────────────
+
+def _call_openrouter(messages: list, max_tokens: int = 300, temperature: float = 0):
+    payload = json.dumps({
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }).encode()
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                 "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"]
+
+
+_STOPWORDS = {"的","了","是","在","我","有","和","就","不","人","都","一","一个","上","也","很",
+              "到","说","要","去","你","会","着","没有","看","好","自己","这","那","他","她","它",
+              "们","個","係","咁","咗","呢","喺","得","而","之","與","及","或","但","嗰"}
+
+
+def _extract_keywords(text: str, top_n: int = 25) -> list[str]:
+    """Two-stage LLM keyword extraction for Cantonese/Chinese."""
+    # Stage 1: sample up to 120 segments for topic words
+    sentences = re.split(r'[。！？\.\!\?，,]', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 3]
+    step = max(1, len(sentences) // 120) if len(sentences) > 120 else 1
+    sample = sentences[::step][:120]
+    sample_text = "\n".join(sample)
+
+    topic_prompt = f"""你係廣東話語音分析助手。以下係一段語音嘅部分字幕，請提取最多25個關鍵詞。
+
+規則：
+- 只揀名詞、專有名詞、品牌名、地名、術語
+- 唔好揀單字（至少2個字）
+- 唔好揀虛詞（係、咁、呢、喺）
+- 用粵語口語風格
+
+格式：每行一個詞，純文字。
+
+字幕：
+{sample_text}"""
+
+    try:
+        raw = _call_openrouter([{"role":"user","content":topic_prompt}], max_tokens=400)
+        topics = [line.strip() for line in raw.split("\n") if line.strip() and len(line.strip()) > 1]
+        topics = [t for t in topics if t not in _STOPWORDS]
+    except Exception:
+        topics = []
+
+    # Stage 2: chunk-based extraction with topic hints
+    all_kws = []
+    chunk_size = 30
+    for i in range(0, len(sentences), chunk_size):
+        chunk = sentences[i:i+chunk_size]
+        chunk_text = "\n".join(chunk)
+        hint = "相關主題：" + "、".join(topics[:10]) if topics else ""
+        prompt = f"""{hint}
+
+以下係一段字幕，請提取關鍵詞（名詞/專有名詞）。
+格式：詞語|詞語|詞語（用 | 分隔，唔好解釋）
+
+{chunk_text}"""
+        try:
+            raw2 = _call_openrouter([{"role":"user","content":prompt}], max_tokens=300)
+            kws = [w.strip() for w in raw2.split("|") if len(w.strip()) > 1]
+            kws = [w for w in kws if w not in _STOPWORDS]
+            all_kws.extend(kws)
+        except Exception:
+            pass
+
+    # TF-IDF fallback if LLM coverage low
+    if len(all_kws) < len(sentences) * 0.3:
+        try:
+            import jieba.analyse
+            jieba_kws = jieba.analyse.extract_tags(text, topK=top_n)
+            all_kws.extend(jieba_kws)
+        except Exception:
+            pass
+
+    # Deduplicate and rank
+    freq = {}
+    for w in all_kws:
+        freq[w] = freq.get(w, 0) + 1
+    ranked = sorted(freq.items(), key=lambda x: -x[1])
+    return [w for w, _ in ranked[:top_n]]
+
+
+# ── Job processing ──────────────────────────────────────────────────────
+
+def _set_status(job_id: str, status: str, **kwargs):
+    with sqlite3.connect(DB_PATH, check_same_thread=False) as c:
+        c.execute("UPDATE jobs SET status=? WHERE id=?", (status, job_id))
+        for k, v in kwargs.items():
+            c.execute(f"UPDATE jobs SET {k}=? WHERE id=?", (v, job_id))
+        c.commit()
+
+
+def _update_job_sse(job_id: str, event_type: str, data: dict):
+    """Push SSE event to job subscribers."""
+    # Simple in-memory queue
+    q = _sse_queues.get(job_id)
+    if q is not None:
+        q.put((event_type, data))
+
+
+from queue import Queue
+_sse_queues: dict[str, Queue] = {}
+
+
+def process_job(job_id: str, video_path: str, engine: str, lang: str):
+    try:
+        _set_status(job_id, "extracting_audio")
+        _update_job_sse(job_id, "status", {"text": "提取音頻中…"})
+
+        audio_path = str(AUDIO_DIR / f"{job_id}.mp3")
+        extract_audio(video_path, audio_path)
+
+        _set_status(job_id, "transcribing")
+        _update_job_sse(job_id, "status", {"text": "轉錄中…"})
+
+        # Transcribe
+        if engine == "whisper":
+            model = get_whisper()
+            whisper_lang = "zh" if lang == "yue" else (lang or None)
+            result = model.transcribe(audio_path, language=whisper_lang)
+            segments = result.get("segments", [])
+        elif engine == "sensevoice":
+            # Placeholder — SenseVoice integration would go here
+            segments = []
+        elif engine == "cantoneseai":
+            segments = _cantoneseai_segments(audio_path, lang)
+        else:
+            model = get_whisper()
+            whisper_lang = "zh" if lang == "yue" else (lang or None)
+            result = model.transcribe(audio_path, language=whisper_lang)
+            segments = result.get("segments", [])
+
+        if not segments:
+            raise RuntimeError("No transcription segments returned")
+
+        # Fix zero-timestamps (SenseVoice sometimes returns all 0)
+        if all(seg.get("start", 0) == 0 and seg.get("end", 0) == 0 for seg in segments):
+            import soundfile as sf
+            info = sf.info(audio_path)
+            total = info.duration
+            n = len(segments)
+            for i, seg in enumerate(segments):
+                seg["start"] = i * (total / n)
+                seg["end"] = (i + 1) * (total / n)
+
+        # Write SRT
+        srt_content = segments_to_srt(segments)
+        srt_path = str(JOB_DIR / f"{job_id}.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        # Extract keywords
+        full_text = " ".join(seg.get("text", "") for seg in segments)
+        _set_status(job_id, "extracting_keywords")
+        _update_job_sse(job_id, "status", {"text": "提取關鍵詞…"})
+        keywords = _extract_keywords(full_text)
+        kw_path = str(JOB_DIR / f"{job_id}_keywords.json")
+        with open(kw_path, "w", encoding="utf-8") as f:
+            json.dump(keywords, f, ensure_ascii=False)
+
+        _set_status(job_id, "done", srt_path=srt_path, keywords_path=kw_path)
+        _update_job_sse(job_id, "done", {
+            "srt": f"/file/{job_id}.srt",
+            "keywords": f"/file/{job_id}_keywords.json",
+        })
+
+    except Exception as e:
+        _set_status(job_id, "error", error=str(e))
+        _update_job_sse(job_id, "error", {"error": str(e)})
+
+
+def _cantoneseai_segments(audio_path: str, lang: str) -> list[dict]:
+    """Cantonese.ai transcription — OpenAI-compatible endpoint."""
+    import urllib.request, mimetypes
+    if not CANTONESE_AI_KEY:
+        raise RuntimeError("No CANTONESE_AI_KEY set")
+
+    boundary = "----CantoneseAI"
+    fname = os.path.basename(audio_path)
+    mime, _ = mimetypes.guess_type(audio_path)
+    mime = mime or "audio/mpeg"
+
+    with open(audio_path, "rb") as f:
+        file_data = f.read()
+
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n").encode() + file_data + b"\r\n"
+    body += (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="model"\r\n\r\n'
+             f"cantonese-1\r\n").encode()
+    body += (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="response_format"\r\n\r\n'
+             f"verbose_json\r\n").encode()
+    body += (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="timestamp_granularities[]"\r\n\r\n'
+             f"segment\r\n").encode()
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        "https://api.cantonese.ai/v1/audio/transcriptions",
+        data=body,
+        headers={"Authorization": f"Bearer {CANTONESE_AI_KEY}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+    return data.get("segments", [])
+
+
+# ── Routes ───────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    f = request.files.get("video")
+    if not f:
+        return jsonify({"error": "No video file"}), 400
+    engine = request.form.get("engine", "whisper")
+    lang = request.form.get("lang", "yue")
+
+    job_id = uuid.uuid4().hex
+    vid_path = str(JOB_DIR / f"{job_id}_video")
+    f.save(vid_path)
+
+    with sqlite3.connect(DB_PATH, check_same_thread=False) as c:
+        c.execute("INSERT INTO jobs (id, status, engine, lang) VALUES (?, 'pending', ?, ?)",
+                   (job_id, engine, lang))
+        c.commit()
+
+    threading.Thread(target=process_job, args=(job_id, vid_path, engine, lang), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/events/<job_id>")
+def events(job_id):
+    def gen():
+        q = Queue()
+        _sse_queues[job_id] = q
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                event_type, data = q.get(timeout=300)
+                yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                if event_type in ("done", "error"):
+                    break
+        except Exception:
+            pass
+        finally:
+            _sse_queues.pop(job_id, None)
+    return Response(gen(), mimetype="text/event-stream")
+
+
+@app.route("/status/<job_id>")
+def status(job_id):
+    with sqlite3.connect(DB_PATH, check_same_thread=False) as c:
+        row = c.execute("SELECT status, error, srt_path, keywords_path FROM jobs WHERE id=?",
+                        (job_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Unknown job"}), 404
+    status, error, srt, kw = row
+    return jsonify({"status": status, "error": error,
+                    "srt": f"/file/{job_id}.srt" if srt else None,
+                    "keywords": f"/file/{job_id}_keywords.json" if kw else None})
+
+
+@app.route("/file/<job_id>.srt")
+def serve_srt(job_id):
+    p = JOB_DIR / f"{job_id}.srt"
+    if not p.exists():
+        return "Not found", 404
+    return Response(p.read_text(encoding="utf-8"), mimetype="text/plain")
+
+
+@app.route("/file/<job_id>_keywords.json")
+def serve_keywords(job_id):
+    p = JOB_DIR / f"{job_id}_keywords.json"
+    if not p.exists():
+        return jsonify([])
+    return Response(p.read_text(encoding="utf-8"), mimetype="application/json")
+
+
+# ── HTML Frontend ──────────────────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>普通話 TTS + STT</title>
+<title>Video STT — 字幕提取 + 關鍵詞高亮</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif; background: #0f0f14; color: #e8e8e8; min-height: 100vh; }
-  .container { max-width: 800px; margin: 0 auto; padding: 32px 20px; }
-  h1 { text-align: center; font-size: 1.8rem; margin-bottom: 4px; color: #fff; }
-  .subtitle { text-align: center; color: #888; margin-bottom: 32px; font-size: 0.9rem; }
-  .card { background: #1a1a24; border: 1px solid #2a2a38; border-radius: 16px; padding: 24px; margin-bottom: 20px; }
-  .card h2 { font-size: 1rem; color: #a78bfa; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-  select, textarea { width: 100%; background: #0f0f14; border: 1px solid #2a2a38; border-radius: 10px; color: #e8e8e8; padding: 12px; font-size: 1rem; font-family: inherit; outline: none; transition: border 0.2s; }
-  select:focus, textarea:focus { border-color: #a78bfa; }
-  textarea { resize: vertical; min-height: 120px; line-height: 1.6; }
-  .row { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
-  button { flex: 1; min-width: 120px; padding: 12px 20px; border: none; border-radius: 10px; font-size: 1rem; cursor: pointer; font-family: inherit; font-weight: 600; transition: opacity 0.2s, transform 0.1s; }
-  button:active { transform: scale(0.97); }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-primary { background: linear-gradient(135deg, #7c3aed, #a78bfa); color: #fff; }
-  .btn-secondary { background: #2a2a38; color: #e8e8e8; }
-  .btn-danger { background: linear-gradient(135deg, #dc2626, #ef4444); color: #fff; }
-  .btn-success { background: linear-gradient(135deg, #059669, #34d399); color: #fff; }
-  audio { width: 100%; margin-top: 14px; border-radius: 8px; }
-  .status { margin-top: 12px; font-size: 0.88rem; color: #888; min-height: 20px; }
-  .status.ok { color: #34d399; }
-  .status.err { color: #f87171; }
-  .status.loading { color: #a78bfa; }
-  .transcript-box { background: #0f0f14; border: 1px solid #2a2a38; border-radius: 10px; padding: 14px; margin-top: 14px; min-height: 60px; line-height: 1.7; font-size: 1rem; white-space: pre-wrap; color: #e8e8e8; }
-  .download-link { display: inline-block; margin-top: 10px; color: #a78bfa; font-size: 0.88rem; text-decoration: none; }
-  .download-link:hover { text-decoration: underline; }
-  .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; display: inline-block; animation: pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
-  .char-count { text-align: right; font-size: 0.78rem; color: #555; margin-top: 4px; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'PingFang SC','Microsoft YaHei',sans-serif;background:#0f0f14;color:#e8e8e8;min-height:100vh}
+  .container{max-width:900px;margin:0 auto;padding:32px 20px}
+  h1{font-size:1.6rem;margin-bottom:8px}
+  .subtitle{color:#888;font-size:0.9rem;margin-bottom:24px}
+  .card{background:#1a1a24;border-radius:16px;padding:24px;margin-bottom:20px;border:1px solid #2a2a38}
+  select, input[type=file]{width:100%;background:#0f0f14;border:1px solid #2a2a38;border-radius:10px;color:#e8e8e8;padding:12px;font-size:1rem;outline:none}
+  select:focus{border-color:#a78bfa}
+  .row{display:flex;gap:12px;margin-top:16px}
+  button{border:none;border-radius:10px;padding:12px 20px;font-size:1rem;cursor:pointer;font-weight:600}
+  .btn-primary{background:linear-gradient(135deg,#c9a227,#a78bfa);color:#0f0f14}
+  .btn-secondary{background:#2a2a38;color:#aaa}
+  .status{margin-top:14px;font-size:0.9rem;min-height:24px}
+  .status.ok{color:#4ade80}
+  .status.err{color:#f87171}
+  .status.loading{color:#fbbf24}
+  #video-container{position:relative;margin-top:16px;display:none}
+  video{width:100%;border-radius:12px;background:#000}
+  .cue-layer{position:absolute;bottom:60px;left:0;right:0;text-align:center;padding:0 20px;pointer-events:none}
+  .cue-layer span{background:rgba(0,0,0,0.7);color:#fff;padding:6px 14px;border-radius:8px;font-size:1.1rem;line-height:1.6}
+  .cue-layer span mark{background:transparent;color:#ff4444;font-weight:bold}
+  #keywords{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+  #keywords span{background:#2a2a38;color:#c9a227;padding:6px 12px;border-radius:20px;font-size:0.85rem}
+  .progress-bar{height:4px;background:#2a2a38;border-radius:2px;margin-top:12px;overflow:hidden;display:none}
+  .progress-fill{height:100%;background:linear-gradient(90deg,#c9a227,#a78bfa);width:0%;transition:width .3s}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>🀄 普通話 TTS + STT</h1>
-  <p class="subtitle">文字轉語音 &amp; 語音轉文字 · Mandarin Chinese</p>
+  <h1>🎬 Video STT — 字幕提取 + 關鍵詞高亮</h1>
+  <p class="subtitle">上傳影片 → 自動轉錄 → AI 關鍵詞 → 字幕覆蓋</p>
 
-  <!-- TTS Card -->
   <div class="card">
-    <h2>🔊 文字轉語音 Text → Speech</h2>
-    <select id="voice">
-      {% for v in voices %}
-      <option value="{{ v.id }}">{{ v.label }}</option>
-      {% endfor %}
-    </select>
-    <div style="margin:10px 0 4px; display:flex; align-items:center; gap:12px">
-      <label style="color:#aaa; font-size:0.88rem; white-space:nowrap">語速 Speed</label>
-      <input type="range" id="speed" min="0.5" max="2.0" step="0.05" value="1.0" style="flex:1; accent-color:#c9a227">
-      <span id="speed-val" style="color:#c9a227; font-size:0.88rem; width:36px; text-align:right">1.0×</span>
+    <div style="display:flex;gap:12px;margin-bottom:12px">
+      <select id="engine">
+        <option value="whisper" selected>Whisper（本地，免費）</option>
+        <option value="cantoneseai">Cantonese AI（廣東話專用）</option>
+      </select>
+      <select id="lang">
+        <option value="yue" selected>粵語 Cantonese</option>
+        <option value="zh">普通話 Mandarin</option>
+        <option value="en">English</option>
+      </select>
     </div>
-    <textarea id="tts-text" placeholder="在這裡輸入普通話文字…&#10;Type Mandarin text here..."></textarea>
+    <input type="file" id="video-file" accept="video/*">
+    <div class="progress-bar" id="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
     <div class="row">
-      <button class="btn-primary" onclick="doTTS()">🔊 生成語音</button>
-      <button class="btn-secondary" onclick="document.getElementById('tts-text').value=''">清除</button>
+      <button class="btn-primary" onclick="doUpload()">🎬 上傳並轉錄</button>
+      <button class="btn-secondary" onclick="clearAll()">清除</button>
     </div>
-    <div class="status" id="tts-status"></div>
-    <audio id="tts-audio" controls style="display:none"></audio>
-    <a id="tts-download" class="download-link" style="display:none" download>⬇ 下載 MP3</a>
+    <div class="status" id="status"></div>
   </div>
 
-  <!-- STT Card -->
-  <div class="card">
-    <h2>🎙️ 語音轉文字 Speech → Text</h2>
-    <p style="color:#888; font-size:0.88rem; margin-bottom:14px">上傳音頻文件，或直接錄音。模型：Whisper（本地免費）</p>
-
-    <div style="margin-bottom:12px">
-      <input type="file" id="audio-file" accept="audio/*" style="color:#aaa; font-size:0.88rem" onchange="fileSelected()">
+  <div class="card" id="result-card" style="display:none">
+    <div id="video-container">
+      <video id="player" controls></video>
+      <div class="cue-layer" id="cue"><span></span></div>
     </div>
-
-    <div class="row">
-      <button class="btn-danger" id="rec-btn" onclick="toggleRecord()">🎙️ 開始錄音</button>
-      <button class="btn-success" onclick="doSTT()" id="stt-btn">📝 轉錄文字</button>
+    <div id="keywords"></div>
+    <div style="margin-top:16px">
+      <a id="srt-link" class="btn-secondary" style="display:inline-block;text-decoration:none" download>⬇ 下載 SRT</a>
     </div>
-    <div class="status" id="stt-status"></div>
-    <div class="transcript-box" id="transcript" style="display:none"></div>
-    <button class="btn-secondary" id="copy-btn" style="display:none; margin-top:10px; flex:none; width:auto" onclick="copyTranscript()">📋 複製文字</button>
   </div>
 </div>
 
 <script>
-let mediaRecorder, audioChunks = [], recordedBlob = null, isRecording = false;
+let cues = [], keywords = [], es = null;
 
-// Speed slider
-document.getElementById('speed').addEventListener('input', function() {
-  document.getElementById('speed-val').textContent = parseFloat(this.value).toFixed(2).replace(/\.?0+$/, '') + '×';
-});
-
-async function doTTS() {
-  const text = document.getElementById('tts-text').value.trim();
-  if (!text) { setStatus('tts', '請輸入文字', 'err'); return; }
-  const voice = document.getElementById('voice').value;
-  const speed = parseFloat(document.getElementById('speed').value);
-  setStatus('tts', '⏳ 生成中，長文本需要稍等...', 'loading');
-  document.querySelector('.btn-primary').disabled = true;
-  try {
-    // Submit job
-    const r = await fetch('/tts', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text, voice, speed})
-    });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    const jobId = d.job_id;
-
-    // Poll until done
-    let url = null;
-    for (let i = 0; i < 300; i++) {
-      await new Promise(res => setTimeout(res, 2000));
-      const sr = await fetch('/tts/status/' + jobId);
-      const sd = await sr.json();
-      if (sd.status === 'done') { url = sd.url; break; }
-      if (sd.status === 'error') throw new Error(sd.error);
-      const elapsed = Math.round((i+1)*2);
-      setStatus('tts', `⏳ 生成中... ${elapsed}s`, 'loading');
-    }
-    if (!url) throw new Error('Timeout waiting for audio');
-
-    const audio = document.getElementById('tts-audio');
-    audio.src = url + '?t=' + Date.now();
-    audio.style.display = 'block';
-    audio.play();
-    const dl = document.getElementById('tts-download');
-    dl.href = url;
-    dl.style.display = 'inline-block';
-    setStatus('tts', '✅ 完成！', 'ok');
-  } catch(e) { setStatus('tts', '❌ ' + e.message, 'err'); }
-  document.querySelector('.btn-primary').disabled = false;
+function setStatus(msg, type='ok'){
+  const el = document.getElementById('status');
+  el.textContent = msg; el.className = 'status ' + type;
 }
 
-async function toggleRecord() {
-  if (!isRecording) {
-    audioChunks = []; recordedBlob = null;
-    const stream = await navigator.mediaDevices.getUserMedia({audio: true});
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-    mediaRecorder.onstop = () => {
-      recordedBlob = new Blob(audioChunks, {type: 'audio/webm'});
-      stream.getTracks().forEach(t => t.stop());
-      setStatus('stt', '✅ 錄音完成，點擊「轉錄文字」', 'ok');
-    };
-    mediaRecorder.start();
-    isRecording = true;
-    document.getElementById('rec-btn').innerHTML = '<span class="rec-dot"></span> 停止錄音';
-    document.getElementById('rec-btn').className = 'btn-secondary';
-    setStatus('stt', '🔴 錄音中...', 'loading');
-  } else {
-    mediaRecorder.stop();
-    isRecording = false;
-    document.getElementById('rec-btn').innerHTML = '🎙️ 開始錄音';
-    document.getElementById('rec-btn').className = 'btn-danger';
+function clearAll(){
+  document.getElementById('video-file').value = '';
+  document.getElementById('result-card').style.display = 'none';
+  document.getElementById('video-container').style.display = 'none';
+  if(es){ es.close(); es=null; }
+  cues=[]; keywords=[];
+}
+
+async function doUpload(){
+  const file = document.getElementById('video-file').files[0];
+  if(!file){ setStatus('請選擇影片','err'); return; }
+  setStatus('⏳ 上傳中…','loading');
+  document.querySelector('.btn-primary').disabled = true;
+  document.getElementById('progress-bar').style.display = 'block';
+
+  const fd = new FormData();
+  fd.append('video', file);
+  fd.append('engine', document.getElementById('engine').value);
+  fd.append('lang', document.getElementById('lang').value);
+
+  try {
+    const r = await fetch('/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    pollJob(d.job_id, file);
+  } catch(e){
+    setStatus('❌ '+e.message,'err');
+    document.querySelector('.btn-primary').disabled = false;
   }
 }
 
-function fileSelected() {
-  recordedBlob = null;
-  setStatus('stt', '📂 文件已選擇，點擊「轉錄文字」', 'ok');
+function pollJob(jobId, file){
+  setStatus('⏳ 處理中，請稍候…','loading');
+  // SSE for real-time updates
+  es = new EventSource('/events/'+jobId);
+  es.addEventListener('status', e => {
+    const d = JSON.parse(e.data);
+    setStatus(d.text, 'loading');
+  });
+  es.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    showResult(file, d.srt, d.keywords, jobId);
+    es.close();
+  });
+  es.addEventListener('error', e => {
+    const d = JSON.parse(e.data);
+    setStatus('❌ '+d.error, 'err');
+    es.close();
+    document.querySelector('.btn-primary').disabled = false;
+  });
+  // Fallback polling if SSE drops
+  es.onerror = () => {
+    es.close();
+    fallbackPoll(jobId, file);
+  };
 }
 
-async function doSTT() {
-  const fileInput = document.getElementById('audio-file');
-  let blob = recordedBlob || (fileInput.files[0] || null);
-  if (!blob) { setStatus('stt', '請先錄音或選擇文件', 'err'); return; }
-  setStatus('stt', '⏳ 轉錄中（Whisper）...', 'loading');
-  document.getElementById('stt-btn').disabled = true;
-  const fd = new FormData();
-  fd.append('audio', blob, 'audio.webm');
-  try {
-    const r = await fetch('/stt', {method: 'POST', body: fd});
+async function fallbackPoll(jobId, file){
+  for(let i=0;i<300;i++){
+    await new Promise(r=>setTimeout(r,2000));
+    const r = await fetch('/status/'+jobId);
     const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    const box = document.getElementById('transcript');
-    box.textContent = d.text;
-    box.style.display = 'block';
-    document.getElementById('copy-btn').style.display = 'inline-block';
-    setStatus('stt', '✅ 轉錄完成', 'ok');
-  } catch(e) { setStatus('stt', '❌ ' + e.message, 'err'); }
-  document.getElementById('stt-btn').disabled = false;
+    if(d.status==='done'){ showResult(file, d.srt, d.keywords, jobId); return; }
+    if(d.status==='error'){ setStatus('❌ '+d.error,'err'); document.querySelector('.btn-primary').disabled=false; return; }
+    setStatus(`⏳ 處理中… ${d.status}`,'loading');
+  }
+  setStatus('⏳ 超時，請檢查狀態','err');
+  document.querySelector('.btn-primary').disabled = false;
 }
 
-function copyTranscript() {
-  navigator.clipboard.writeText(document.getElementById('transcript').textContent);
-  document.getElementById('copy-btn').textContent = '✅ 已複製';
-  setTimeout(() => document.getElementById('copy-btn').textContent = '📋 複製文字', 1500);
+async function showResult(file, srtUrl, kwUrl, jobId){
+  setStatus('✅ 完成！','ok');
+  document.querySelector('.btn-primary').disabled = false;
+  document.getElementById('progress-bar').style.display = 'none';
+
+  // Load video
+  const video = document.getElementById('player');
+  video.src = URL.createObjectURL(file);
+  document.getElementById('video-container').style.display = 'block';
+  document.getElementById('result-card').style.display = 'block';
+
+  // Load keywords
+  try {
+    const kr = await fetch(kwUrl);
+    keywords = await kr.json();
+    const kwDiv = document.getElementById('keywords');
+    kwDiv.innerHTML = keywords.map(k=>`<span>${k}</span>`).join('');
+  } catch(e){ keywords=[]; }
+
+  // Load SRT
+  try {
+    const sr = await fetch(srtUrl);
+    const srtText = await sr.text();
+    cues = parseSRT(srtText);
+    attachSubtitle(video);
+  } catch(e){ setStatus('SRT 載入失敗: '+e.message,'err'); }
+
+  document.getElementById('srt-link').href = srtUrl;
+  document.getElementById('srt-link').download = jobId + '.srt';
 }
 
-function setStatus(id, msg, type) {
-  const el = document.getElementById(id + '-status');
-  el.textContent = msg;
-  el.className = 'status ' + (type || '');
+function parseSRT(text){
+  const lines = text.trim().split(/\r?\n/);
+  const out = [];
+  let i=0;
+  while(i<lines.length){
+    if(!lines[i].trim() || lines[i].trim().match(/^\d+$/)){
+      if(lines[i].trim().match(/^\d+$/)) i++;
+      if(i>=lines.length) break;
+      const timeLine = lines[i++];
+      const match = timeLine.match(/([\d:,]+)\s*-->\s*([\d:,]+)/);
+      if(!match){ i++; continue; }
+      const start = srtTimeToSecs(match[1]);
+      const end = srtTimeToSecs(match[2]);
+      let textLines = [];
+      while(i<lines.length && lines[i].trim()){ textLines.push(lines[i].trim()); i++; }
+      out.push({start, end, text: textLines.join('\n')});
+    } else { i++; }
+  }
+  return out;
+}
+
+function srtTimeToSecs(t){
+  const m = t.match(/(\d{2}):(\d{2}):(\d{2}),(\d{3})/);
+  if(!m) return 0;
+  return parseInt(m[1])*3600 + parseInt(m[2])*60 + parseInt(m[3]) + parseInt(m[4])/1000;
+}
+
+function highlightText(text){
+  if(!keywords.length) return text;
+  const sorted = [...keywords].sort((a,b)=>b.length-a.length);
+  let out = text;
+  for(const kw of sorted){
+    const re = new RegExp(`(${kw.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'g');
+    out = out.replace(re,'<mark>$1</mark>');
+  }
+  return out;
+}
+
+function attachSubtitle(video){
+  const cue = document.querySelector('#cue span');
+  video.addEventListener('timeupdate', () => {
+    const t = video.currentTime;
+    const seg = cues.find(c => c.start <= t && t <= c.end);
+    if(seg) cue.innerHTML = highlightText(seg.text);
+    else cue.textContent = '';
+  });
 }
 </script>
 </body>
 </html>
 """
 
-@app.route("/")
-def index():
-    return render_template_string(HTML, voices=VOICES)
-
-def chunk_text(text, size=500):
-    """Split text into chunks at sentence boundaries."""
-    sentences = re.split(r'(?<=[。！？\.\!\?])', text)
-    chunks, cur = [], ""
-    for s in sentences:
-        if len(cur) + len(s) > size and cur:
-            chunks.append(cur.strip())
-            cur = s
-        else:
-            cur += s
-    if cur.strip():
-        chunks.append(cur.strip())
-    return chunks or [text]
-
-async def save_chunk(chunk, voice, path, retries=3, rate="+0%"):
-    for attempt in range(retries):
-        try:
-            await asyncio.wait_for(
-                edge_tts.Communicate(chunk, voice, rate=rate).save(path),
-                timeout=30
-            )
-            return
-        except Exception:
-            if attempt == retries - 1:
-                raise
-            await asyncio.sleep(2)
-
-async def edge_synthesize(text, voice, path, speed=1.0):
-    rate = f"{int((speed - 1.0) * 100):+d}%"
-    chunks = chunk_text(text)
-    if len(chunks) == 1:
-        await save_chunk(text, voice, path, rate=rate)
-        return
-    parts = []
-    for i, chunk in enumerate(chunks):
-        p = path + f".part{i}.mp3"
-        await save_chunk(chunk, voice, p, rate=rate)
-        parts.append(p)
-    with open(path, "wb") as out:
-        for p in parts:
-            with open(p, "rb") as f:
-                out.write(f.read())
-            os.remove(p)
-
-def gtts_synthesize(text, lang_code, path):
-    tld = "com.tw" if lang_code == "zh-TW" else "com"
-    gTTS(text=text, lang="zh", tld=tld).save(path)
-
-def azure_synthesize(text, voice, path, speed=1.0):
-    import urllib.request, html as html_mod
-    rate_pct = f"{int((speed - 1.0) * 100):+d}%"
-    token_url = f"https://{AZURE_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
-    # token fetched inside _call per chunk
-
-    def _call(chunk):
-        import urllib.request
-        ssml = f"""<speak version='1.0' xml:lang='zh-CN'>
-<voice name='{voice}'><prosody rate='{rate_pct}'>{html_mod.escape(chunk)}</prosody></voice>
-</speak>"""
-        token_req = urllib.request.Request(
-            f"https://{AZURE_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken",
-            method="POST",
-            headers={"Ocp-Apim-Subscription-Key": AZURE_KEY, "Content-Length": "0"}
-        )
-        with urllib.request.urlopen(token_req) as resp:
-            token = resp.read().decode()
-
-        tts_req = urllib.request.Request(
-            f"https://{AZURE_REGION}.tts.speech.microsoft.com/cognitiveservices/v1",
-            data=ssml.encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/ssml+xml",
-                "X-Microsoft-OutputFormat": "audio-48khz-192kbitrate-mono-mp3",
-                "User-Agent": "mandarin-tts-app"
-            }
-        )
-        with urllib.request.urlopen(tts_req, timeout=180) as resp:
-            chunks_data = []
-            while True:
-                try:
-                    buf = resp.read(65536)
-                except Exception:
-                    break
-                if not buf:
-                    break
-                chunks_data.append(buf)
-            return b"".join(chunks_data)
-
-    # Split at paragraph breaks every ~3000 chars max
-    chunks = chunk_text(text, size=3000)
-    with open(path, "wb") as f:
-        for chunk in chunks:
-            f.write(_call(chunk))
-
-@app.route("/tts", methods=["POST"])
-def tts():
-    data = request.json
-    text = data.get("text", "").strip()
-    voice = data.get("voice", "edge:zh-CN-XiaoxiaoNeural")
-    speed = float(data.get("speed", 1.0))
-    speed = max(0.5, min(2.0, speed))
-    if not text:
-        return jsonify({"error": "No text provided"})
-
-    job_id = uuid.uuid4().hex
-    fname = f"{job_id}.mp3"
-    path = os.path.join(AUDIO_DIR, fname)
-    jobs[job_id] = {"status": "pending"}
-
-    engine, voice_id = voice.split(":", 1) if ":" in voice else ("edge", voice)
-
-    def run():
-        try:
-            if engine == "gtts":
-                gtts_synthesize(text, voice_id, path)
-            elif engine == "azure":
-                azure_synthesize(text, voice_id, path, speed=speed)
-            else:
-                try:
-                    asyncio.run(edge_synthesize(text, voice_id, path, speed=speed))
-                except Exception:
-                    lang = "zh-TW" if "TW" in voice_id else "zh-CN"
-                    gtts_synthesize(text, lang, path)
-            jobs[job_id] = {"status": "done", "url": f"/audio/{fname}"}
-        except Exception as e:
-            jobs[job_id] = {"status": "error", "error": str(e)}
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({"job_id": job_id})
-
-@app.route("/tts/status/<job_id>")
-def tts_status(job_id):
-    job = jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Unknown job"}), 404
-    return jsonify(job)
-
-@app.route("/audio/<fname>")
-def serve_audio(fname):
-    path = os.path.join(AUDIO_DIR, fname)
-    return send_file(path, mimetype="audio/mpeg")
-
-@app.route("/stt", methods=["POST"])
-def stt():
-    f = request.files.get("audio")
-    if not f:
-        return jsonify({"error": "No audio file"})
-    fname = f"{uuid.uuid4().hex}.webm"
-    path = os.path.join(AUDIO_DIR, fname)
-    f.save(path)
-    result = whisper_model.transcribe(path, language="zh")
-    os.remove(path)
-    return jsonify({"text": result["text"]})
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False)

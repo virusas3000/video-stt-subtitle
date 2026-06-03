@@ -1,3 +1,10 @@
-flask>=2.3.0
-edge-tts>=6.1.9
-openai-whisper>=20231117
+flask>=2.0
+openai-whisper
+gtts
+google-cloud-speech
+edge-tts
+jieba
+soundfile
+numpy
+azure-cognitiveservices-speech
+urllib3
