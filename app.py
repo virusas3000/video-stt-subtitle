@@ -7,7 +7,7 @@ import os, sys, asyncio, json, re, uuid, threading, math, sqlite3, shutil, urlli
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, Response, render_template_string, send_file
 
 # ── Config ───────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", "5055"))
@@ -394,6 +394,47 @@ def serve_keywords(job_id):
     return Response(p.read_text(encoding="utf-8"), mimetype="application/json")
 
 
+FFMPEG_FULL = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+
+
+@app.route("/burn/<job_id>")
+def burn_video(job_id):
+    """Burn SRT subtitles into the original video using ffmpeg-full."""
+    srt_path = JOB_DIR / f"{job_id}.srt"
+    vid_path = JOB_DIR / f"{job_id}_video"
+    out_path = JOB_DIR / f"{job_id}_subtitled.mp4"
+
+    if not srt_path.exists():
+        return jsonify({"error": "SRT not found — transcription incomplete"}), 404
+    if not vid_path.exists():
+        return jsonify({"error": "Original video not found"}), 404
+
+    import subprocess
+    cmd = [
+        FFMPEG_FULL, "-y", "-i", str(vid_path),
+        "-vf", f"subtitles={str(srt_path)}:force_style='FontName=PingFang HK,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,Alignment=2'",
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-c:a", "copy",
+        str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        return send_file(str(out_path), mimetype="video/mp4", as_attachment=True,
+                         download_name=f"{job_id}_subtitled.mp4")
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": f"ffmpeg failed: {e.stderr.decode()[:200]}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/file/<job_id>_subtitled.mp4")
+def serve_burned(job_id):
+    p = JOB_DIR / f"{job_id}_subtitled.mp4"
+    if not p.exists():
+        return jsonify({"error": "Not found"}), 404
+    return send_file(str(p), mimetype="video/mp4")
+
+
 # ── HTML Frontend ──────────────────────────────────────────────────────
 
 HTML = """<!DOCTYPE html>
@@ -462,8 +503,9 @@ HTML = """<!DOCTYPE html>
       <div class="cue-layer" id="cue"><span></span></div>
     </div>
     <div id="keywords"></div>
-    <div style="margin-top:16px">
+    <div style="margin-top:16px;display:flex;gap:12px">
       <a id="srt-link" class="btn-secondary" style="display:inline-block;text-decoration:none" download>⬇ 下載 SRT</a>
+      <button class="btn-secondary" id="burn-btn" onclick="doBurn()">🔥 嵌入字幕並下載 MP4</button>
     </div>
   </div>
 </div>
@@ -547,6 +589,7 @@ async function fallbackPoll(jobId, file){
 }
 
 async function showResult(file, srtUrl, kwUrl, jobId){
+  currentJobId = jobId;
   setStatus('✅ 完成！','ok');
   document.querySelector('.btn-primary').disabled = false;
   document.getElementById('progress-bar').style.display = 'none';
@@ -623,6 +666,31 @@ function attachSubtitle(video){
     if(seg) cue.innerHTML = highlightText(seg.text);
     else cue.textContent = '';
   });
+}
+
+let currentJobId = '';
+
+async function doBurn(){
+  if(!currentJobId){ setStatus('請先上傳並轉錄影片','err'); return; }
+  setStatus('⏳ 嵌入字幕中…','loading');
+  document.getElementById('burn-btn').disabled = true;
+  try {
+    const r = await fetch('/burn/' + currentJobId, {method: 'GET'});
+    if(r.ok){
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = currentJobId + '_subtitled.mp4';
+      a.click();
+      setStatus('✅ 字幕已嵌入並下載','ok');
+    } else {
+      const d = await r.json();
+      throw new Error(d.error || 'Burn failed');
+    }
+  } catch(e){
+    setStatus('❌ ' + e.message, 'err');
+  }
+  document.getElementById('burn-btn').disabled = false;
 }
 </script>
 </body>
